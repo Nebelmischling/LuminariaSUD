@@ -24,6 +24,8 @@
   #hud{flex:none;max-height:34%}
   .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;overflow:auto}
   #room{background:var(--room)}
+  #roomimage{display:block;width:100%;height:auto;max-height:240px;object-fit:contain;border-radius:6px;margin:0 0 10px}
+  #roomimage[hidden]{display:none}
   #room h2,#hud h2{margin:0 0 6px;font-size:14px;color:var(--accent);letter-spacing:.05em}
   #log{grid-area:2/2/3/3;min-height:0}
   .line{margin:2px 0;white-space:pre-wrap}
@@ -94,7 +96,7 @@
 <div class="wrap">
   <header><h1>LUMINARIA</h1><span class="sub">the city that forgets itself</span><span id="busydot" title="the game is working"></span></header>
   <div id="left">
-    <div id="room" class="panel"><h2>Room</h2><div id="roombody"></div></div>
+    <div id="room" class="panel"><h2>Room</h2><img id="roomimage" alt="" hidden><div id="roombody"></div></div>
     <div id="inv" class="panel"><h2>Inventory</h2><div id="invbody"></div></div>
     <div id="hud" class="panel"><h2>Character</h2><div id="hudbody"></div></div>
   </div>
@@ -109,6 +111,74 @@ const $ = s => document.querySelector(s);
 const DIR_CMD = {North:'n', South:'s', East:'e', West:'w', Up:'u', Down:'d'};
 // compass cells in grid order: corner, N, U / W, rose, E / corner, S, D
 const COMPASS = [null,'North','Up','West','rose','East',null,'South','Down'];
+const roomImageVisits = new Set();
+// Keep only a few binary images; object URLs belong solely to the displayed room.
+const roomImageCache = new Map();
+let roomImageSession = null, roomImageKey = null, roomImageRequest = null, roomImageURL = null, roomImageTimeout = null;
+
+function clearRoomImage(){
+  if(roomImageRequest){ roomImageRequest.abort(); roomImageRequest = null; }
+  clearTimeout(roomImageTimeout); roomImageTimeout = null;
+  const img = $('#roomimage');
+  img.onload = img.onerror = null;
+  img.hidden = true;
+  img.removeAttribute('src');
+  if(roomImageURL){ URL.revokeObjectURL(roomImageURL); roomImageURL = null; }
+}
+function showRoomImage(blob, room){
+  const img = $('#roomimage');
+  img.alt = 'Illustration of '+(room.name||'this room');
+  roomImageURL = URL.createObjectURL(blob);
+  const url = roomImageURL, key = roomImageKey;
+  img.onload = ()=>{ if(roomImageURL===url) img.hidden = false; };
+  img.onerror = ()=>{
+    if(roomImageURL!==url) return;
+    roomImageCache.delete(key);
+    clearRoomImage();
+  };
+  img.src = roomImageURL;
+}
+function renderRoomImage(s){
+  const r = s.room || {};
+  const context = {session_id:s.session_id==null?null:s.session_id, room_id:r.id};
+  if(context.session_id!==roomImageSession){
+    roomImageSession = context.session_id;
+    roomImageVisits.clear();
+    roomImageCache.clear();
+  }
+  const key = r.id==null ? null : JSON.stringify(context);
+  if(key===roomImageKey) return;
+  clearRoomImage();
+  roomImageKey = key;
+  if(roomImageCache.has(key)){ showRoomImage(roomImageCache.get(key), r); return; }
+  if(key===null || roomImageVisits.has(key)) return;
+  roomImageVisits.add(key);
+  const controller = new AbortController();
+  roomImageRequest = controller;
+  const timeout = setTimeout(()=>controller.abort(), 90000);
+  roomImageTimeout = timeout;
+  // Image generation is optional and deliberately independent of command/poll busy state.
+  // Like commands/state, the server selects the game actor and its current room.
+  // Never send a client-authored scene or any provider credentials.
+  fetch('/api/room-image', {
+    method:'POST', credentials:'same-origin', signal:controller.signal
+  }).then(async response=>{
+    const responseRoom = response.headers.get('X-Room-Id');
+    if(!response.ok || response.status===204 || controller.signal.aborted || key!==roomImageKey ||
+       (responseRoom!==null && responseRoom!==String(r.id))){
+      if(response.body) await response.body.cancel();
+      return;
+    }
+    const blob = await response.blob();
+    if(controller.signal.aborted || key!==roomImageKey || !blob.size || !blob.type.startsWith('image/')) return;
+    roomImageCache.set(key, blob);
+    if(roomImageCache.size>8) roomImageCache.delete(roomImageCache.keys().next().value);
+    showRoomImage(blob, r);
+  }).catch(()=>{}).finally(()=>{
+    clearTimeout(timeout);
+    if(roomImageRequest===controller){ roomImageRequest = null; roomImageTimeout = null; }
+  });
+}
 
 function addLine(e){
   const d = document.createElement('div');
@@ -203,6 +273,7 @@ function renderSnapshot(s){
   $('#roombody').innerHTML = h;
   renderHud(s);
   renderInv(s);
+  renderRoomImage(s);
 }
 async function poll(){
   let j;
@@ -257,6 +328,8 @@ document.addEventListener('click', e=>{
   send(act + ' ' + item);
 });
 window.addEventListener('focus',()=>{ if(!polling) refreshState(); });
+window.addEventListener('pagehide',()=>{ clearRoomImage(); roomImageKey = null; });
+window.addEventListener('pageshow',e=>{ if(e.persisted) refreshState(); });
 $('#send').onclick=()=>send();
 $('#cmd').addEventListener('keydown',e=>{
   if(e.key==='Enter'){ send(); return; }

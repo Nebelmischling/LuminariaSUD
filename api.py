@@ -31,15 +31,17 @@ Run:  python3 api.py            (http://127.0.0.1:8090)
 """
 
 import argparse
+import copy
 import os
 import threading
 
 import io_layer
 import ui
 import luminaria as L
+from room_images import RoomImageCache
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
     from pydantic import BaseModel
 except ImportError as _e:  # friendly hint instead of a raw traceback
     import sys
@@ -54,6 +56,10 @@ except ImportError as _e:  # friendly hint instead of a raw traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(BASE, "static")
+ROOM_IMAGES = RoomImageCache(
+    os.path.join(BASE, "state", "room_images.sqlite3"),
+    os.environ.get("NANOGPT_API_KEY", ""),
+)
 
 # ---- shared game state (the actor) ----
 CFG = L.load_cfg()
@@ -154,6 +160,40 @@ def events(cursor: int = 0):
         # refresh panels once the command has finished
         "snapshot": None if _busy else _snapshot_safe(),
     })
+
+
+@app.post("/api/room-image")
+def room_image():
+    """Same shared actor as /state and /command; never accept a client scene.
+
+    The POST waits for its image, not the game actor. Concurrent or unavailable
+    requests get an empty 204. X-Room-Id lets clients discard late room art.
+    """
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    if not _lock.acquire(blocking=False):
+        return Response(status_code=204, headers=headers)
+    try:
+        if _busy:
+            return Response(status_code=204, headers=headers)
+        pos = GAME.eng.player.data["position"]
+        room_id = f"{pos['x']}_{pos['y']}_{pos['z']}"
+        headers["X-Room-Id"] = room_id
+        world = GAME.eng.world
+        # Read existing rooms only: get_room() can generate/save a whole floor.
+        room = copy.deepcopy(world.town_rooms.get(room_id) or world.rooms.get(room_id))
+    finally:
+        _lock.release()
+    if not room:
+        return Response(status_code=204, headers=headers)
+    try:
+        image = ROOM_IMAGES.get(room_id, room)
+    except Exception:
+        # Optional artwork must never turn a game request into an error.
+        image = None
+    if image is None:
+        return Response(status_code=204, headers=headers)
+    headers["Content-Disposition"] = "inline"
+    return Response(content=image.data, media_type=image.media_type, headers=headers)
 
 
 @app.post("/api/command")
